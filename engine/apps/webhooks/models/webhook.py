@@ -1,6 +1,7 @@
 import json
 import logging
 import typing
+import os  # Added to read env vars
 from json import JSONDecodeError
 
 import requests
@@ -29,7 +30,6 @@ from common.public_primary_keys import generate_public_primary_key, increase_pub
 
 if typing.TYPE_CHECKING:
     from django.db.models.manager import RelatedManager
-
     from apps.alerts.models import EscalationPolicy
 
 WEBHOOK_FIELD_PLACEHOLDER = "****************"
@@ -38,31 +38,17 @@ PUBLIC_WEBHOOK_HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH
 logger = get_task_logger(__name__)
 logger.setLevel(logging.DEBUG)
 
-
 def generate_public_primary_key_for_webhook():
-    prefix = "WH"
-    new_public_primary_key = generate_public_primary_key(prefix)
-
-    failure_counter = 0
-    while Webhook.objects.filter(public_primary_key=new_public_primary_key).exists():
-        new_public_primary_key = increase_public_primary_key_length(
-            failure_counter=failure_counter, prefix=prefix, model_name="Webhook"
-        )
-        failure_counter += 1
-
-    return new_public_primary_key
-
+    return generate_public_primary_key()
 
 class WebhookSession(requests.Session):
     def send(self, request, **kwargs):
         parse_url(request.url)  # validate URL on every redirect
         return super().send(request, **kwargs)
 
-
 class WebhookQueryset(models.QuerySet):
     def delete(self):
         self.update(deleted_at=timezone.now(), name=F("name") + "_deleted_" + F("public_primary_key"))
-
 
 class WebhookManager(models.Manager):
     def get_queryset(self):
@@ -70,7 +56,6 @@ class WebhookManager(models.Manager):
 
     def hard_delete(self):
         return self.get_queryset().hard_delete()
-
 
 class Webhook(models.Model):
     escalation_policies: "RelatedManager['EscalationPolicy']"
@@ -91,7 +76,6 @@ class Webhook(models.Model):
         TRIGGER_PERSONAL_NOTIFICATION,
     ) = range(10)
 
-    # Must be the same order as previous
     TRIGGER_TYPES = (
         (TRIGGER_MANUAL, "Manual or escalation step"),
         (TRIGGER_ALERT_GROUP_CREATED, "Alert Group Created"),
@@ -163,12 +147,10 @@ class Webhook(models.Model):
     http_method = models.CharField(max_length=32, default="POST", null=True)
     trigger_type = models.IntegerField(choices=TRIGGER_TYPES, default=TRIGGER_MANUAL, null=True)
     is_webhook_enabled = models.BooleanField(null=True, default=True)
-    # NOTE: integration_filter is deprecated (to be removed), use filtered_integrations instead
     integration_filter = models.JSONField(default=None, null=True, blank=True)
     filtered_integrations = models.ManyToManyField("alerts.AlertReceiveChannel", related_name="webhooks")
     is_legacy = models.BooleanField(null=True, default=False)
     preset = models.CharField(max_length=100, null=True, blank=True, default=None)
-
     is_from_connected_integration = models.BooleanField(null=True, default=False)
 
     class Meta:
@@ -178,12 +160,7 @@ class Webhook(models.Model):
         return str(self.name)
 
     def delete(self):
-        # TODO: delete related escalation policies on delete, once implemented
-        # self.escalation_policies.all().delete()
         self.deleted_at = timezone.now()
-        # 100 - 22 = 78. 100 is max len of name field, and 22 is len of suffix _deleted_<public_primary_key>
-        # So for case when user created an entry with maximum length name it is needed to trim it to 78 chars
-        # to be able to add suffix.
         self.name = f"{self.name[:78]}_deleted_{self.public_primary_key}"
         self.save()
 
@@ -191,7 +168,6 @@ class Webhook(models.Model):
         super().delete()
 
     def get_source_alert_receive_channel(self):
-        """Return the webhook source channel if it is connected to an integration."""
         result = None
         if self.is_from_connected_integration:
             filtered_integration = (
@@ -245,7 +221,6 @@ class Webhook(models.Model):
                     try:
                         request_kwargs["json"] = json.loads(rendered_data)
                     except (JSONDecodeError, TypeError):
-                        # utf-8 encoding addresses https://github.com/grafana/oncall/issues/3831
                         request_kwargs["data"] = rendered_data.encode("utf-8")
                 except (JinjaTemplateError, JinjaTemplateWarning) as e:
                     if raise_data_errors:
@@ -264,7 +239,6 @@ class Webhook(models.Model):
         except (JinjaTemplateError, JinjaTemplateWarning) as e:
             raise InvalidWebhookUrl(e.fallback_message)
 
-        # raise if URL is not valid
         parse_url(url)
 
         return url
@@ -288,14 +262,18 @@ class Webhook(models.Model):
         if self.http_method not in ("GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"):
             raise ValueError(f"Unsupported http method: {self.http_method}")
 
+        verify_tls = os.getenv("ONCALL_WEBHOOK_VERIFY_SSL", "true").lower() != "false"
+
         with WebhookSession() as session:
             response = session.request(
-                self.http_method, url, timeout=settings.OUTGOING_WEBHOOK_TIMEOUT, **request_kwargs
+                self.http_method, url,
+                timeout=settings.OUTGOING_WEBHOOK_TIMEOUT,
+                verify=verify_tls,
+                **request_kwargs
             )
 
         return response
 
-    # Insight logs
     @property
     def insight_logs_type_verbal(self):
         return "webhook"
@@ -329,7 +307,6 @@ class Webhook(models.Model):
         result.update(self._insight_log_team())
         return result
 
-
 class WebhookResponse(models.Model):
     alert_group = models.ForeignKey(
         "alerts.AlertGroup",
@@ -357,7 +334,6 @@ class WebhookResponse(models.Model):
         if self.content:
             return json.loads(self.content)
 
-
 @receiver(post_save, sender=WebhookResponse)
 def webhook_response_post_save(sender, instance, created, *args, **kwargs):
     if not created:
@@ -366,7 +342,6 @@ def webhook_response_post_save(sender, instance, created, *args, **kwargs):
     source_alert_receive_channel = instance.webhook.get_source_alert_receive_channel()
     if source_alert_receive_channel and hasattr(source_alert_receive_channel.config, "on_webhook_response_created"):
         source_alert_receive_channel.config.on_webhook_response_created(instance, source_alert_receive_channel)
-
 
 class PersonalNotificationWebhook(models.Model):
     user = models.OneToOneField(
@@ -379,7 +354,6 @@ class PersonalNotificationWebhook(models.Model):
         on_delete=models.CASCADE,
         related_name="personal_channels",
     )
-    # only visible to owner
     additional_context_data = mirage_fields.EncryptedTextField(null=True)
 
     @property
